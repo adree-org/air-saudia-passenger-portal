@@ -1,0 +1,371 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: aspp_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-aspp}
+      POSTGRES_USER: ${POSTGRES_USER:-aspp_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - aspp_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aspp_user} -d ${POSTGRES_DB:-aspp}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "127.0.0.1:5432:5432"
+    env_file:
+      - .env
+
+  redis:
+    image: redis:7-alpine
+    container_name: aspp_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --appendonly yes
+      --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    networks:
+      - aspp_internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    ports:
+      - "127.0.0.1:6379:6379"
+    env_file:
+      - .env
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        NODE_ENV: ${NODE_ENV:-production}
+    container_name: aspp_backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: ${BACKEND_PORT:-3000}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-aspp_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-aspp}?sslmode=disable
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      JWT_PRIVATE_KEY_PATH: ${JWT_PRIVATE_KEY_PATH:-/run/secrets/jwt_private_key}
+      JWT_PUBLIC_KEY_PATH: ${JWT_PUBLIC_KEY_PATH:-/run/secrets/jwt_public_key}
+      JWT_ACCESS_TOKEN_TTL_SECONDS: ${JWT_ACCESS_TOKEN_TTL_SECONDS:-900}
+      JWT_REFRESH_TOKEN_TTL_SECONDS: ${JWT_REFRESH_TOKEN_TTL_SECONDS:-604800}
+      JWT_ISSUER: ${JWT_ISSUER:-https://aspp.airsaudia.com.sa}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-aspp-api}
+      BCRYPT_ROUNDS: ${BCRYPT_ROUNDS:-12}
+      OTP_EXPIRY_MINUTES: ${OTP_EXPIRY_MINUTES:-10}
+      SESSION_IDLE_TIMEOUT_MINUTES: ${SESSION_IDLE_TIMEOUT_MINUTES:-30}
+      MAX_LOGIN_ATTEMPTS: ${MAX_LOGIN_ATTEMPTS:-5}
+      PSS_API_BASE_URL: ${PSS_API_BASE_URL}
+      PSS_API_KEY: ${PSS_API_KEY}
+      PSS_API_TIMEOUT_MS: ${PSS_API_TIMEOUT_MS:-8000}
+      LOYALTY_API_BASE_URL: ${LOYALTY_API_BASE_URL}
+      LOYALTY_API_KEY: ${LOYALTY_API_KEY}
+      LOYALTY_API_TIMEOUT_MS: ${LOYALTY_API_TIMEOUT_MS:-8000}
+      BMS_API_BASE_URL: ${BMS_API_BASE_URL}
+      BMS_API_KEY: ${BMS_API_KEY}
+      BMS_SYNC_INTERVAL_MINUTES: ${BMS_SYNC_INTERVAL_MINUTES:-5}
+      PAYMENT_GATEWAY_BASE_URL: ${PAYMENT_GATEWAY_BASE_URL}
+      PAYMENT_GATEWAY_API_KEY: ${PAYMENT_GATEWAY_API_KEY}
+      PAYMENT_GATEWAY_WEBHOOK_SECRET: ${PAYMENT_GATEWAY_WEBHOOK_SECRET}
+      SMS_GATEWAY_BASE_URL: ${SMS_GATEWAY_BASE_URL}
+      SMS_GATEWAY_API_KEY: ${SMS_GATEWAY_API_KEY}
+      SMS_GATEWAY_SENDER_ID: ${SMS_GATEWAY_SENDER_ID:-AirSaudia}
+      EMAIL_SERVICE_HOST: ${EMAIL_SERVICE_HOST}
+      EMAIL_SERVICE_PORT: ${EMAIL_SERVICE_PORT:-587}
+      EMAIL_SERVICE_USER: ${EMAIL_SERVICE_USER}
+      EMAIL_SERVICE_PASSWORD: ${EMAIL_SERVICE_PASSWORD}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-noreply@airsaudia.com.sa}
+      EMAIL_FROM_NAME_AR: ${EMAIL_FROM_NAME_AR:-الخطوط السعودية}
+      EMAIL_FROM_NAME_EN: ${EMAIL_FROM_NAME_EN:-Air Saudia}
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_REGION: ${S3_REGION:-me-central-1}
+      S3_BUCKET_BAGGAGE_DOCS: ${S3_BUCKET_BAGGAGE_DOCS:-aspp-baggage-documents}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_PRESIGNED_URL_TTL_SECONDS: ${S3_PRESIGNED_URL_TTL_SECONDS:-900}
+      KMS_ENDPOINT: ${KMS_ENDPOINT}
+      KMS_KEY_ID_PII: ${KMS_KEY_ID_PII}
+      KMS_REGION: ${KMS_REGION:-me-central-1}
+      PDPL_CONSENT_VERSION: ${PDPL_CONSENT_VERSION:-v2.1}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-https://portal.airsaudia.com.sa}
+      RATE_LIMIT_PUBLIC_RPM: ${RATE_LIMIT_PUBLIC_RPM:-100}
+      RATE_LIMIT_AUTH_RPM: ${RATE_LIMIT_AUTH_RPM:-300}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      REBOOKING_CUTOFF_HOURS: ${REBOOKING_CUTOFF_HOURS:-2}
+      MILES_MIN_REDEMPTION: ${MILES_MIN_REDEMPTION:-1000}
+      MILES_INCREMENT: ${MILES_INCREMENT:-500}
+      MILES_TO_SAR_RATE: ${MILES_TO_SAR_RATE:-0.01}
+      SEAT_SELECTION_CLOSE_HOURS: ${SEAT_SELECTION_CLOSE_HOURS:-48}
+      BOARDING_PASS_PDF_TIMEOUT_MS: ${BOARDING_PASS_PDF_TIMEOUT_MS:-5000}
+      WALLET_PAYLOAD_SANITISER_ENABLED: ${WALLET_PAYLOAD_SANITISER_ENABLED:-true}
+      APPLE_WALLET_BASE_URL: ${APPLE_WALLET_BASE_URL}
+      GOOGLE_WALLET_BASE_URL: ${GOOGLE_WALLET_BASE_URL}
+      BULL_CONCURRENCY_NOTIFICATIONS: ${BULL_CONCURRENCY_NOTIFICATIONS:-5}
+      BULL_CONCURRENCY_BMS_SYNC: ${BULL_CONCURRENCY_BMS_SYNC:-2}
+      BULL_CONCURRENCY_BOARDING_PASS: ${BULL_CONCURRENCY_BOARDING_PASS:-3}
+    volumes:
+      - ./backend:/app:ro
+      - backend_node_modules:/app/node_modules
+      - backend_logs:/app/logs
+    networks:
+      - aspp_internal
+      - aspp_external
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:${BACKEND_PORT:-3000}/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-https://api.portal.airsaudia.com.sa/v1}
+        VITE_DEFAULT_LANGUAGE: ${VITE_DEFAULT_LANGUAGE:-ar}
+        VITE_PAYMENT_GATEWAY_JS_SDK_URL: ${VITE_PAYMENT_GATEWAY_JS_SDK_URL}
+        VITE_SENTRY_DSN: ${VITE_SENTRY_DSN:-}
+        VITE_APP_VERSION: ${VITE_APP_VERSION:-1.0.0}
+    container_name: aspp_frontend
+    restart: unless-stopped
+    volumes:
+      - frontend_dist:/usr/share/nginx/html:ro
+      - ./frontend/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend/nginx/conf.d:/etc/nginx/conf.d:ro
+    networks:
+      - aspp_internal
+      - aspp_external
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    ports:
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: aspp_worker
+    restart: unless-stopped
+    command: ["node", "dist/worker/index.js"]
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-aspp_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-aspp}?sslmode=disable
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      SMS_GATEWAY_BASE_URL: ${SMS_GATEWAY_BASE_URL}
+      SMS_GATEWAY_API_KEY: ${SMS_GATEWAY_API_KEY}
+      SMS_GATEWAY_SENDER_ID: ${SMS_GATEWAY_SENDER_ID:-AirSaudia}
+      EMAIL_SERVICE_HOST: ${EMAIL_SERVICE_HOST}
+      EMAIL_SERVICE_PORT: ${EMAIL_SERVICE_PORT:-587}
+      EMAIL_SERVICE_USER: ${EMAIL_SERVICE_USER}
+      EMAIL_SERVICE_PASSWORD: ${EMAIL_SERVICE_PASSWORD}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-noreply@airsaudia.com.sa}
+      BMS_API_BASE_URL: ${BMS_API_BASE_URL}
+      BMS_API_KEY: ${BMS_API_KEY}
+      BMS_SYNC_INTERVAL_MINUTES: ${BMS_SYNC_INTERVAL_MINUTES:-5}
+      PSS_API_BASE_URL: ${PSS_API_BASE_URL}
+      PSS_API_KEY: ${PSS_API_KEY}
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_REGION: ${S3_REGION:-me-central-1}
+      S3_BUCKET_BAGGAGE_DOCS: ${S3_BUCKET_BAGGAGE_DOCS:-aspp-baggage-documents}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      KMS_ENDPOINT: ${KMS_ENDPOINT}
+      KMS_KEY_ID_PII: ${KMS_KEY_ID_PII}
+      KMS_REGION: ${KMS_REGION:-me-central-1}
+      BULL_CONCURRENCY_NOTIFICATIONS: ${BULL_CONCURRENCY_NOTIFICATIONS:-5}
+      BULL_CONCURRENCY_BMS_SYNC: ${BULL_CONCURRENCY_BMS_SYNC:-2}
+      BULL_CONCURRENCY_BOARDING_PASS: ${BULL_CONCURRENCY_BOARDING_PASS:-3}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      WALLET_PAYLOAD_SANITISER_ENABLED: ${WALLET_PAYLOAD_SANITISER_ENABLED:-true}
+      APPLE_WALLET_BASE_URL: ${APPLE_WALLET_BASE_URL}
+      GOOGLE_WALLET_BASE_URL: ${GOOGLE_WALLET_BASE_URL}
+    volumes:
+      - ./backend:/app:ro
+      - backend_node_modules:/app/node_modules
+      - worker_logs:/app/logs
+    networks:
+      - aspp_internal
+      - aspp_external
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node dist/worker/healthcheck.js || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+  pgbouncer:
+    image: edoburu/pgbouncer:1.21.0
+    container_name: aspp_pgbouncer
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-aspp_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-aspp}
+      POOL_MODE: ${PGBOUNCER_POOL_MODE:-transaction}
+      MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-200}
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-25}
+      MIN_POOL_SIZE: ${PGBOUNCER_MIN_POOL_SIZE:-5}
+      RESERVE_POOL_SIZE: ${PGBOUNCER_RESERVE_POOL_SIZE:-5}
+      SERVER_IDLE_TIMEOUT: ${PGBOUNCER_SERVER_IDLE_TIMEOUT:-600}
+      CLIENT_IDLE_TIMEOUT: ${PGBOUNCER_CLIENT_IDLE_TIMEOUT:-0}
+      LOG_CONNECTIONS: ${PGBOUNCER_LOG_CONNECTIONS:-0}
+      LOG_DISCONNECTIONS: ${PGBOUNCER_LOG_DISCONNECTIONS:-0}
+      AUTH_TYPE: md5
+      ADMIN_USERS: ${POSTGRES_USER:-aspp_user}
+    volumes:
+      - ./database/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    networks:
+      - aspp_internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 5432 -U ${POSTGRES_USER:-aspp_user} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    ports:
+      - "127.0.0.1:5433:5432"
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aspp_migrate
+    restart: "no"
+    command: ["npx", "prisma", "migrate", "deploy"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-aspp_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-aspp}?sslmode=disable
+      NODE_ENV: ${NODE_ENV:-production}
+    volumes:
+      - ./backend:/app:ro
+      - backend_node_modules:/app/node_modules
+    networks:
+      - aspp_internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+
+volumes:
+  postgres_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${POSTGRES_DATA_PATH:-./data/postgres}
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${REDIS_DATA_PATH:-./data/redis}
+  backend_node_modules:
+    driver: local
+  frontend_dist:
+    driver: local
+  backend_logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${BACKEND_LOG_PATH:-./logs/backend}
+  worker_logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${WORKER_LOG_PATH:-./logs/worker}
+
+networks:
+  aspp_internal:
+    driver: bridge
+    internal: true
+    ipam:
+      driver: default
+      config:
+        - subnet: ${INTERNAL_NETWORK_SUBNET:-172.20.0.0/24}
+    labels:
+      com.airsaudia.network: "internal"
+      com.airsaudia.pdpl: "pii-network"
+  aspp_external:
+    driver: bridge
+    internal: false
+    ipam:
+      driver: default
+      config:
+        - subnet: ${EXTERNAL_NETWORK_SUBNET:-172.21.0.0/24}
+    labels:
+      com.airsaudia.network: "external"
