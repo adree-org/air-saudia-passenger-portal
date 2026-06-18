@@ -1,0 +1,345 @@
+name: Air Saudia Passenger Portal CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Allows manual trigger
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: me-south-1 # KSA region Riyadh
+  ECR_REPOSITORY_BACKEND: air-saudia-api
+  ECR_REPOSITORY_FRONTEND: air-saudia-frontend
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Job 1: Backend Tests (.NET)
+  # ----------------------------------------------------------------------------
+  backend-test:
+    name: Backend Unit & Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: Y
+          SA_PASSWORD: "YourStrong@Password1" # Placeholder, actual DB_CONNECTION_STRING will be used by app
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'YourStrong@Password1' -Q 'SELECT 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: dotnet restore
+        run: dotnet restore backend/Api.csproj
+
+      - name: dotnet build (Release)
+        run: dotnet build backend/Api.csproj -c Release --no-restore
+
+      - name: Run backend tests
+        # The test project's appsettings.json or TestServer setup should override
+        # the connection string to point to the service container 'db'.
+        # Example connection string for tests: "Server=localhost,1433;Database=TestDb;User Id=sa;Password=YourStrong@Password1;Encrypt=False;"
+        run: dotnet test backend/Api.csproj --no-build --verbosity normal
+        env:
+          ConnectionStrings__Default: "Server=localhost,1433;Database=TestDb;User Id=sa;Password=YourStrong@Password1;Encrypt=False;TrustServerCertificate=True;"
+          # Note: Ensure your test project can pick this up, or create a specific test appsettings.json
+          # For a real scenario, consider using testcontainers-dotnet or similar for more robust integration tests.
+
+  # ----------------------------------------------------------------------------
+  # Job 2: Frontend Tests (Angular)
+  # ----------------------------------------------------------------------------
+  frontend-test:
+    name: Frontend Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18.x'
+
+      - name: Install Angular CLI (globally or locally)
+        # Using local node_modules/.bin/ng if package.json includes it
+        run: npm install -g @angular/cli@17 # Or add "@angular/cli" to devDependencies and use npx ng
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix frontend
+
+      - name: Build Angular app for testing (production config)
+        run: ng build --configuration production --prefix frontend
+
+      - name: Run Angular tests
+        run: ng test --watch=false --browsers=ChromeHeadless --prefix frontend
+
+  # ----------------------------------------------------------------------------
+  # Job 3: Build & Push Docker Images to ECR
+  # ----------------------------------------------------------------------------
+  build-and-push:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    needs: [backend-test, frontend-test] # Depends on tests passing
+    environment: Build
+
+    permissions:
+      id-token: write # Required for OIDC
+      contents: read
+      packages: write # For GitHub Packages if used, but we're pushing to ECR
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-oidc-role # Ensure this IAM role exists
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push backend Docker image
+        id: build-backend-image
+        run: |
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_BACKEND }}:${{ github.sha }} -f backend/Dockerfile .
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_BACKEND }}:${{ github.sha }}
+        working-directory: . # Ensure context is root for Dockerfile paths
+
+      - name: Build and push frontend Docker image
+        id: build-frontend-image
+        run: |
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_FRONTEND }}:${{ github.sha }} -f frontend/Dockerfile .
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_FRONTEND }}:${{ github.sha }}
+        working-directory: . # Ensure context is root for Dockerfile paths
+
+  # ----------------------------------------------------------------------------
+  # Job 4: Security Scan (Trivy)
+  # ----------------------------------------------------------------------------
+  security-scan:
+    name: Image Security Scan
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    environment: Build
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-oidc-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr-scan
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Run Trivy scan on backend image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr-scan.outputs.registry }}/${{ env.ECR_REPOSITORY_BACKEND }}:${{ github.sha }}
+          format: 'table'
+          exit-code: '1'
+          severity: 'HIGH,CRITICAL'
+          # Add custom .trivyignore if needed
+
+      - name: Run Trivy scan on frontend image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr-scan.outputs.registry }}/${{ env.ECR_REPOSITORY_FRONTEND }}:${{ github.sha }}
+          format: 'table'
+          exit-code: '1'
+          severity: 'HIGH,CRITICAL'
+
+  # ----------------------------------------------------------------------------
+  # Job 5: Deploy to Staging
+  # ----------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging EKS
+    runs-on: ubuntu-latest
+    needs: [security-scan] # Deploy only if security scan passes
+    environment: staging
+
+    permissions:
+      id-token: write # Required for OIDC
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-oidc-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Kubeconfig for Staging Cluster
+        # This assumes the KUBECONFIG secret contains credentials for a specific staging cluster
+        # For production-grade, use aws-actions/amazon-eks-configure-kubeconfig with OIDC
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Update Kubernetes manifests
+        # Replace image placeholders in k8s/deployment.yaml with the new ECR image tags
+        # Also update secrets and configmap placeholders
+        run: |
+          REGISTRY="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          sed -i "s|YOUR_ECR_REGISTRY/${{ env.ECR_REPOSITORY_BACKEND }}:latest|$REGISTRY/${{ env.ECR_REPOSITORY_BACKEND }}:${{ github.sha }}|g" k8s/deployment.yaml
+          sed -i "s|YOUR_ECR_REGISTRY/${{ env.ECR_REPOSITORY_FRONTEND }}:latest|$REGISTRY/${{ env.ECR_REPOSITORY_FRONTEND }}:${{ github.sha }}|g" k8s/deployment.yaml
+          
+          # Apply environment-specific overrides for staging
+          sed -i "s|#DB_CONNECTION_STRING_STAGING#|${{ secrets.DB_CONNECTION_STRING_STAGING }}|g" k8s/secrets.yaml
+          sed -i "s|#JWT_SECRET_KEY_STAGING#|${{ secrets.JWT_SECRET_KEY_STAGING }}|g" k8s/secrets.yaml
+          sed -i "s|#CORS_ORIGIN_STAGING#|${{ vars.CORS_ORIGIN_STAGING }}|g" k8s/configmap.yaml # CorsOrigin can be a var
+
+      - name: Deploy to EKS Staging
+        run: |
+          kubectl apply -f k8s/namespace.yaml # Ensure namespace exists
+          kubectl apply -f k8s/secrets.yaml -n air-saudia-staging
+          kubectl apply -f k8s/configmap.yaml -n air-saudia-staging
+          kubectl apply -f k8s/deployment.yaml -n air-saudia-staging
+          kubectl apply -f k8s/service.yaml -n air-saudia-staging
+          kubectl apply -f k8s/ingress.yaml -n air-saudia-staging
+          kubectl rollout status deployment/airsaudia-api -n air-saudia-staging --timeout=5m
+          kubectl rollout status deployment/airsaudia-frontend -n air-saudia-staging --timeout=5m
+
+      - name: Smoke Test Staging /health endpoint
+        run: |
+          # Get the ALB Ingress URL for the staging environment
+          INGRESS_HOST=$(kubectl get ingress airsaudia-ingress -n air-saudia-staging -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          if [ -z "$INGRESS_HOST" ]; then
+            echo "Staging Ingress host not found. Waiting for ALB provisioning..."
+            sleep 60 # Give ALB some time to provision
+            INGRESS_HOST=$(kubectl get ingress airsaudia-ingress -n air-saudia-staging -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -z "$INGRESS_HOST" ]; then
+              echo "Staging Ingress host still not found after wait. Manual check required."
+              exit 1
+            fi
+          fi
+          echo "Staging Ingress Host: https://$INGRESS_HOST"
+          # Wait for the backend service to be ready and available via Ingress
+          for i in $(seq 1 10); do
+            echo "Attempt $i: Checking https://$INGRESS_HOST/api/health"
+            # Use --insecure for self-signed or staging certs, or ensure proper cert setup
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://$INGRESS_HOST/api/health || true)
+            if [ "$HTTP_CODE" -eq 200 ]; then
+              echo "Staging API /health check passed!"
+              exit 0
+            else
+              echo "Health check failed with status $HTTP_CODE. Retrying..."
+              sleep 10
+            fi
+          done
+          echo "Staging API /health check failed after multiple attempts."
+          exit 1
+
+  # ----------------------------------------------------------------------------
+  # Job 6: Deploy to Production
+  # ----------------------------------------------------------------------------
+  deploy-production:
+    name: Deploy to Production EKS
+    runs-on: ubuntu-latest
+    needs: [deploy-staging] # Only deploy to prod if staging deployment and smoke tests pass
+    environment:
+      name: production
+      url: https://your-production-domain.com/ # Replace with actual production domain
+    
+    # Require manual approval for production deployment
+    permissions:
+      id-token: write # Required for OIDC
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-oidc-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Kubeconfig for Production Cluster
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Update Kubernetes manifests for Production
+        run: |
+          REGISTRY="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          sed -i "s|YOUR_ECR_REGISTRY/${{ env.ECR_REPOSITORY_BACKEND }}:latest|$REGISTRY/${{ env.ECR_REPOSITORY_BACKEND }}:${{ github.sha }}|g" k8s/deployment.yaml
+          sed -i "s|YOUR_ECR_REGISTRY/${{ env.ECR_REPOSITORY_FRONTEND }}:latest|$REGISTRY/${{ env.ECR_REPOSITORY_FRONTEND }}:${{ github.sha }}|g" k8s/deployment.yaml
+
+          # Apply environment-specific overrides for production
+          sed -i "s|#DB_CONNECTION_STRING_STAGING#|${{ secrets.DB_CONNECTION_STRING_PROD }}|g" k8s/secrets.yaml
+          sed -i "s|#JWT_SECRET_KEY_STAGING#|${{ secrets.JWT_SECRET_KEY_PROD }}|g" k8s/secrets.yaml
+          sed -i "s|#CORS_ORIGIN_STAGING#|${{ vars.CORS_ORIGIN_PROD }}|g" k8s/configmap.yaml # CorsOrigin can be a var
+          # Reset staging specific placeholders if they are not meant for prod
+          sed -i "s|#DB_CONNECTION_STRING_PROD#|${{ secrets.DB_CONNECTION_STRING_PROD }}|g" k8s/secrets.yaml
+          sed -i "s|#JWT_SECRET_KEY_PROD#|${{ secrets.JWT_SECRET_KEY_PROD }}|g" k8s/secrets.yaml
+          sed -i "s|#CORS_ORIGIN_PROD#|${{ vars.CORS_ORIGIN_PROD }}|g" k8s/configmap.yaml
+
+
+      - name: Deploy to EKS Production
+        run: |
+          kubectl apply -f k8s/namespace.yaml # Ensure namespace exists
+          kubectl apply -f k8s/secrets.yaml -n air-saudia-production
+          kubectl apply -f k8s/configmap.yaml -n air-saudia-production
+          kubectl apply -f k8s/deployment.yaml -n air-saudia-production
+          kubectl apply -f k8s/service.yaml -n air-saudia-production
+          kubectl apply -f k8s/ingress.yaml -n air-saudia-production
+          kubectl rollout status deployment/airsaudia-api -n air-saudia-production --timeout=5m
+          kubectl rollout status deployment/airsaudia-frontend -n air-saudia-production --timeout=5m
+
+      - name: Smoke Test Production /health endpoint
+        run: |
+          # Get the ALB Ingress URL for the production environment
+          INGRESS_HOST=$(kubectl get ingress airsaudia-ingress -n air-saudia-production -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          if [ -z "$INGRESS_HOST" ]; then
+            echo "Production Ingress host not found. Waiting for ALB provisioning..."
+            sleep 60
+            INGRESS_HOST=$(kubectl get ingress airsaudia-ingress -n air-saudia-production -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -z "$INGRESS_HOST" ]; then
+              echo "Production Ingress host still not found after wait. Manual check required."
+              exit 1
+            fi
+          fi
+          echo "Production Ingress Host: https://$INGRESS_HOST"
+          for i in $(seq 1 10); do
+            echo "Attempt $i: Checking https://$INGRESS_HOST/api/health"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://$INGRESS_HOST/api/health || true)
+            if [ "$HTTP_CODE" -eq 200 ]; then
+              echo "Production API /health check passed!"
+              exit 0
+            else
+              echo "Health check failed with status $HTTP_CODE. Retrying..."
+              sleep 10
+            fi
+          done
+          echo "Production API /health check failed after multiple attempts."
+          exit 1
